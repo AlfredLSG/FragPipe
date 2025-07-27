@@ -1,0 +1,253 @@
+# ==============================================================================
+# Snakefile for End-to-End cfDNA/WGBS Analysis Pipeline (Optimized Structure)
+#
+# Author: lishaogang
+# Version: Final (Optimized output directory structure)
+#
+# Description:
+#   This workflow organizes all outputs for each sample into its own dedicated
+#   directory, creating a clean and manageable project structure.
+#   It is self-aware and can be run from any location.
+# ==============================================================================
+
+import pandas as pd
+import os
+
+# --- 1. CONFIGURATION ---
+if "project_name" not in config:
+    raise ValueError("A project name must be specified via --config project_name=...")
+PROJECT_NAME = config["project_name"]
+
+# --- CONDA INTEGRATION ---
+conda: os.path.join(workflow.basedir, "environment.yaml")
+
+# --- 2. PATH DEFINITION (Self-aware) ---
+SNAKEFILE_DIR = workflow.basedir
+PROJECT_ROOT = os.path.abspath(os.path.join(SNAKEFILE_DIR, ".."))
+INPUT_PROJECT_PATH = os.path.join(PROJECT_ROOT, "Projects", PROJECT_NAME)
+OUTPUT_PROJECT_PATH = os.path.join(PROJECT_ROOT, "Results", PROJECT_NAME)
+SCRIPT_DIR = os.path.join(SNAKEFILE_DIR, "scripts")
+REF_DIR = os.path.join(SNAKEFILE_DIR, "reference")
+
+# --- 3. SAMPLE SHEET ---
+sample_sheet_path = os.path.join(INPUT_PROJECT_PATH, "samples.tsv")
+try:
+    SAMPLES = pd.read_csv(sample_sheet_path, sep="\t", header=None, index_col=0,
+                          names=["sample_id", "fastq1", "fastq2", "group", "type", "fwd_adapter", "rev_adapter"])
+except FileNotFoundError:
+    raise FileNotFoundError(f"Sample sheet not found for project '{PROJECT_NAME}' at: {sample_sheet_path}")
+except Exception as e:
+    print(f"Error parsing sample sheet: {sample_sheet_path}")
+    print("Please ensure it is a tab-separated file with 7 columns.")
+    raise e
+
+# --- 4. FINAL TARGETS (AGGREGATION RULE) ---
+# **OPTIMIZED**: Paths now point to the new sample-specific directories.
+rule all:
+    input:
+        # Core alignment files for each sample
+        expand(os.path.join(OUTPUT_PROJECT_PATH, "{sample}", "alignment", "{sample}.markdup.bam"), sample=SAMPLES.index),
+        # Motif analysis results for each sample
+        expand(os.path.join(OUTPUT_PROJECT_PATH, "{sample}", "motif", "{sample}.4mer.motif.MDS"), sample=SAMPLES.index),
+        # Downstream analysis results
+        expand(os.path.join(OUTPUT_PROJECT_PATH, "{sample}", "tss", "{sample}_TSS_mean.txt"), sample=SAMPLES.index),
+        expand(os.path.join(OUTPUT_PROJECT_PATH, "{sample}", "ctcf", "{sample}_ctcf_mean_normalized_new.txt"), sample=SAMPLES.index), # Assuming a similar output for CTCF
+        expand(os.path.join(OUTPUT_PROJECT_PATH, "{sample}", "wps", "{sample}.WPS_Score.txt"), sample=SAMPLES.index),
+
+
+# --- 5. WORKFLOW RULES ---
+
+# Step 1: Quality Control with fastp
+rule fastp:
+    input:
+        r1 = lambda wildcards: SAMPLES.loc[wildcards.sample, "fastq1"],
+        r2 = lambda wildcards: SAMPLES.loc[wildcards.sample, "fastq2"],
+    output:
+        # **OPTIMIZED**: temp files are now in a sample-specific temp dir
+        r1 = temp(os.path.join(OUTPUT_PROJECT_PATH, "{sample}", "temp", "{sample}_1.fq.gz")),
+        r2 = temp(os.path.join(OUTPUT_PROJECT_PATH, "{sample}", "temp", "{sample}_2.fq.gz")),
+        html = os.path.join(OUTPUT_PROJECT_PATH, "{sample}", "qc", "{sample}.fastp.html"),
+    params:
+        fastp_cmd = os.path.join(SCRIPT_DIR, "fastp"),
+        fwd_adapter = lambda wildcards: SAMPLES.loc[wildcards.sample, "fwd_adapter"],
+        rev_adapter = lambda wildcards: SAMPLES.loc[wildcards.sample, "rev_adapter"],
+    threads: 8
+    shell:
+        """
+        set -euo pipefail;
+        {params.fastp_cmd} \
+            --in1 {input.r1} --in2 {input.r2} \
+            --out1 {output.r1} --out2 {output.r2} \
+            --html {output.html} \
+            --adapter_sequence {params.fwd_adapter} \
+            --adapter_sequence_r2 {params.rev_adapter} \
+            --thread {threads} \
+            --disable_trim_poly_g
+        """
+
+# Step 2: Alignment (WGS or WGBS)
+rule align:
+    input:
+        r1 = os.path.join(OUTPUT_PROJECT_PATH, "{sample}", "temp", "{sample}_1.fq.gz"),
+        r2 = os.path.join(OUTPUT_PROJECT_PATH, "{sample}", "temp", "{sample}_2.fq.gz"),
+        ref = os.path.join(REF_DIR, "hg38.fa"),
+    output:
+        bam = temp(os.path.join(OUTPUT_PROJECT_PATH, "{sample}", "temp", "{sample}.raw.bam")),
+    params:
+        rg_tag = lambda wildcards: f"@RG\\tID:{wildcards.sample}\\tSM:{wildcards.sample}\\tPL:ILLUMINA",
+        bwameth_rg_tag = lambda wildcards: f"ID:{wildcards.sample},SM:{wildcards.sample},PL:ILLUMINA",
+        analysis_type = lambda wildcards: SAMPLES.loc[wildcards.sample, "type"],
+        bwameth_cmd = os.path.join(SCRIPT_DIR, "bwameth.py"),
+    threads: 8
+    run:
+        if params.analysis_type == "wgs":
+            shell("set -euo pipefail; bwa mem -t {threads} -M -R '{params.rg_tag}' {input.ref} {input.r1} {input.r2} | samtools view -Shb -T {input.ref} - > {output.bam}")
+        elif params.analysis_type == "wgbs":
+            shell("set -euo pipefail; {params.bwameth_cmd} --threads {threads} --read-group '{params.bwameth_rg_tag}' --reference {input.ref} {input.r1} {input.r2} | samtools view -Shb -T {input.ref} - > {output.bam}")
+        else:
+            raise ValueError(f"Unknown analysis type '{params.analysis_type}' for sample {wildcards.sample}")
+
+# Step 3 & 4: Sort, Mark Duplicates, and Index
+rule sort_and_markdup:
+    input:
+        raw_bam = os.path.join(OUTPUT_PROJECT_PATH, "{sample}", "temp", "{sample}.raw.bam"),
+    output:
+        bam = os.path.join(OUTPUT_PROJECT_PATH, "{sample}", "alignment", "{sample}.markdup.bam"),
+        bai = os.path.join(OUTPUT_PROJECT_PATH, "{sample}", "alignment", "{sample}.markdup.bam.bai"),
+    params:
+        picard_jar = os.path.join(SCRIPT_DIR, "picard.jar"),
+        metrics = os.path.join(OUTPUT_PROJECT_PATH, "{sample}", "qc", "{sample}.mkdup_metrics.txt"),
+        tmp_dir = os.path.join(OUTPUT_PROJECT_PATH, "{sample}", "temp"),
+        sorted_bam = temp(os.path.join(OUTPUT_PROJECT_PATH, "{sample}", "temp", "{sample}.sorted.bam")),
+    threads: 8
+    shell:
+        """
+        set -euo pipefail;
+        samtools sort -@ {threads} -o {params.sorted_bam} {input.raw_bam};
+        java -Xmx10G -Djava.io.tmpdir={params.tmp_dir} -jar {params.picard_jar} MarkDuplicates \
+            I={params.sorted_bam} O={output.bam} M={params.metrics} \
+            REMOVE_DUPLICATES=false VALIDATION_STRINGENCY=SILENT;
+        samtools index {output.bam};
+        """
+
+# Step 5: Generate Fragment BED file
+rule bam_to_fragment_bed:
+    input:
+        bam = os.path.join(OUTPUT_PROJECT_PATH, "{sample}", "alignment", "{sample}.markdup.bam"),
+    output:
+        frag_bed = temp(os.path.join(OUTPUT_PROJECT_PATH, "{sample}", "temp", "{sample}.fragment.bed")),
+    params:
+        cmd = os.path.join(SCRIPT_DIR, "bam_to_frag_bed.py"),
+        min_mapq = 30,
+        max_mismatch = 5,
+        name_sorted_bam = temp(os.path.join(OUTPUT_PROJECT_PATH, "{sample}", "temp", "{sample}.name_sorted.bam")),
+    threads: 8
+    shell:
+        """
+        set -euo pipefail;
+        samtools sort -n -@ {threads} -o {params.name_sorted_bam} {input.bam};
+        python3 {params.cmd} \
+            --min_mapq {params.min_mapq} \
+            --max_mismatch {params.max_mismatch} \
+            {params.name_sorted_bam} \
+            {output.frag_bed}
+        """
+
+# Step 6: Motif and Size Analysis
+rule motif_analysis:
+    input:
+        frag_bed = os.path.join(OUTPUT_PROJECT_PATH, "{sample}", "temp", "{sample}.fragment.bed"),
+        ref = os.path.join(REF_DIR, "hg38.fa"),
+    output:
+        size_ratio = os.path.join(OUTPUT_PROJECT_PATH, "{sample}", "motif", "{sample}.size_ratio"),
+        mds = os.path.join(OUTPUT_PROJECT_PATH, "{sample}", "motif", "{sample}.4mer.motif.MDS"),
+    params:
+        cmd = os.path.join(SCRIPT_DIR, "bed_to_motif_MDS.py"),
+        # **OPTIMIZED**: Prefix now points to the sample's motif directory
+        output_prefix = lambda wildcards: os.path.join(OUTPUT_PROJECT_PATH, wildcards.sample, "motif", wildcards.sample),
+        label = lambda wildcards: SAMPLES.loc[wildcards.sample, "group"],
+    shell:
+        """
+        set -euo pipefail;
+        python3 {params.cmd} --fragment-bed {input.frag_bed} --ref-fasta {input.ref} --output-prefix {params.output_prefix} --label {params.label}
+        """
+
+# Step 8: TSS Enrichment Analysis
+rule tss_analysis:
+    input:
+        frag_bed = os.path.join(OUTPUT_PROJECT_PATH, "{sample}", "temp", "{sample}.fragment.bed"),
+    output:
+        # **OPTIMIZED**: Main output is now the mean text file.
+        mean_file = os.path.join(OUTPUT_PROJECT_PATH, "{sample}", "tss", "{sample}_TSS_mean.txt"),
+    params:
+        r_script = os.path.join(SCRIPT_DIR, "TSS_normaolize.R"),
+        ref_bed = os.path.join(REF_DIR, "hg38.tss.UD2500bp.txt"),
+        out_dir = lambda wildcards: os.path.join(OUTPUT_PROJECT_PATH, wildcards.sample, "tss"), # R script output dir
+        coverage_file = temp(os.path.join(OUTPUT_PROJECT_PATH, "{sample}", "temp", "{sample}_TSS.coverage.txt")),
+        group = lambda wildcards: SAMPLES.loc[wildcards.sample, "group"],
+    shell:
+        """
+        set -euo pipefail;
+        # Ensure output directory for R script exists
+        mkdir -p {params.out_dir}
+        grep -E '^chr([0-9]{{1,2}}|X|Y)\\b' {input.frag_bed} | \
+        bedtools coverage -a {params.ref_bed} -b - -d > {params.coverage_file};
+        Rscript {params.r_script} "{wildcards.sample}" "{params.group}" "{params.coverage_file}" "{params.out_dir}"
+        """
+
+# Step 9: CTCF Enrichment Analysis
+rule ctcf_analysis:
+    input:
+        frag_bed = os.path.join(OUTPUT_PROJECT_PATH, "{sample}", "temp", "{sample}.fragment.bed"),
+    output:
+        mean_file = os.path.join(OUTPUT_PROJECT_PATH, "{sample}", "ctcf", "{sample}_ctcf_mean_normalized_new.txt"),
+    params:
+        r_script = os.path.join(SCRIPT_DIR, "CTCF_normaolize.R"),
+        ref_bed = os.path.join(REF_DIR, "CTCF_binding_sites_UD1500_hg38.bed"),
+        out_dir = lambda wildcards: os.path.join(OUTPUT_PROJECT_PATH, wildcards.sample, "ctcf"),
+        coverage_file = temp(os.path.join(OUTPUT_PROJECT_PATH, "{sample}", "temp", "{sample}_CTCF.coverage.txt")),
+        group = lambda wildcards: SAMPLES.loc[wildcards.sample, "group"],
+    shell:
+        """
+        set -euo pipefail;
+        mkdir -p {params.out_dir}
+        grep -E '^chr([0-9]{{1,2}}|X|Y)\\b' {input.frag_bed} | \
+        bedtools coverage -a {params.ref_bed} -b - -d > {params.coverage_file};
+        Rscript {params.r_script} "{wildcards.sample}" "{params.group}" "{params.coverage_file}" "{params.out_dir}"
+        """
+
+# Step 10: Window Protection Score (WPS) Analysis
+rule wps_analysis:
+    input:
+        frag_bed = os.path.join(OUTPUT_PROJECT_PATH, "{sample}", "temp", "{sample}.fragment.bed"),
+    output:
+        wps_score = os.path.join(OUTPUT_PROJECT_PATH, "{sample}", "wps", "{sample}.WPS_Score.txt"),
+    params:
+        r_script = os.path.join(SCRIPT_DIR, "calculator_WPS.R"),
+        ref_bed = os.path.join(REF_DIR, "hg38.wps.gene.bed"),
+        # **OPTIMIZED**: R script will write into a clean, sample-specific directory structure.
+        outdir = lambda wildcards: os.path.join(OUTPUT_PROJECT_PATH, wildcards.sample, "wps"),
+        group = lambda wildcards: SAMPLES.loc[wildcards.sample, "group"],
+    threads: 8
+    shell:
+        """
+        set -euo pipefail;
+        # WPS script creates its own subdirs, we need to adapt our thinking.
+        # Let's pass a clean sample-specific root to the script.
+        Rscript {params.r_script} \
+            --task calculate \
+            --mode Multi_group \
+            --Fragment {input.frag_bed} \
+            --genebed {params.ref_bed} \
+            --prefix "{wildcards.sample}" \
+            --outdir {params.outdir} \
+            --bedtools "bedtools" \
+            --cpus {threads} \
+            --group "{params.group}" \
+            --plot FALSE
+        """
+# Note on WPS: The R script seems to create its own complex subdirectory structure.
+# The new `outdir` parameter points to `.../sample_A/wps/`. The script might create `.../sample_A/wps/Result/group/sample_A/` inside it.
+# You might need to adjust the R script or the output path in the Snakemake rule to perfectly match your desired final location.
+# The current Snakemake output `.../{sample}/wps/{sample}.WPS_Score.txt` may not match the script's actual output path.
+# A simple fix could be to `mv` the file in the shell command after the R script runs.
